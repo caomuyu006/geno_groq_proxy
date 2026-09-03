@@ -10,6 +10,9 @@ const rateLimiter: RateLimiter = {
   lastReset: Date.now(),
 };
 
+// 固定目标地址
+const TARGET_BASE_URL = "https://api.groq.com";
+
 function estimateTokens(body: any): number {
   try {
     const messages = body?.messages || [];
@@ -53,6 +56,7 @@ async function handleRequest(request: Request): Promise<Response> {
   const url = new URL(request.url);
   const pathname = url.pathname;
 
+  // 根路径返回提示
   if (pathname === '/' || pathname === '/index.html') {
     return new Response('Proxy is Running！', {
       status: 200,
@@ -60,7 +64,8 @@ async function handleRequest(request: Request): Promise<Response> {
     });
   }
 
-  if (pathname.includes('api.groq.com')) {
+  // 只要路径以 /v1 开头，就视为 API 请求
+  if (pathname.startsWith('/v1')) {
     resetCountersIfNeeded();
 
     if (rateLimiter.requests >= 30) {
@@ -73,70 +78,77 @@ async function handleRequest(request: Request): Promise<Response> {
       });
     }
 
-    try {
-      const bodyClone = request.clone();
-      const body = await bodyClone.json();
-      const estimatedTokens = estimateTokens(body);
+    // 只有 POST 请求才去读取 body 计算 token
+    if (request.method === 'POST') {
+      try {
+        const bodyClone = request.clone();
+        const body = await bodyClone.json();
+        const estimatedTokens = estimateTokens(body);
 
-      if (rateLimiter.tokens + estimatedTokens > 6000) {
-        return new Response('Token limit exceeded. Max 6000 tokens per minute.', {
-          status: 429,
-          headers: {
-            'Retry-After': '60',
-            'Content-Type': 'application/json'
-          }
-        });
+        if (rateLimiter.tokens + estimatedTokens > 6000) {
+          return new Response('Token limit exceeded. Max 6000 tokens per minute.', {
+            status: 429,
+            headers: {
+              'Retry-After': '60',
+              'Content-Type': 'application/json'
+            }
+          });
+        }
+
+        rateLimiter.tokens += estimatedTokens;
+      } catch (error) {
+        console.error('Error parsing request body:', error);
       }
-
-      rateLimiter.tokens += estimatedTokens;
-    } catch (error) {
-      console.error('Error parsing request body:', error);
     }
 
     rateLimiter.requests++;
-  }
+    
+    // 核心修改点：将请求路径直接拼接到 groq 官网域名后面
+    const targetUrl = `${TARGET_BASE_URL}${pathname}`;
 
-  const targetUrl = `https://${pathname}`;
-
-  try {
-    const headers = new Headers();
-    const allowedHeaders = ['accept', 'content-type', 'authorization'];
-    for (const [key, value] of request.headers.entries()) {
-      if (allowedHeaders.includes(key.toLowerCase())) {
-        headers.set(key, value);
+    try {
+      const headers = new Headers();
+      const allowedHeaders = ['accept', 'content-type', 'authorization'];
+      for (const [key, value] of request.headers.entries()) {
+        if (allowedHeaders.includes(key.toLowerCase())) {
+          headers.set(key, value);
+        }
       }
+
+      const response = await fetch(targetUrl, {
+        method: request.method,
+        headers: headers,
+        body: request.method === 'POST' ? request.body : undefined
+      });
+
+      const responseHeaders = new Headers(response.headers);
+      responseHeaders.set('Referrer-Policy', 'no-referrer');
+      responseHeaders.set('X-RateLimit-Remaining', `${30 - rateLimiter.requests}`);
+      responseHeaders.set('X-TokenLimit-Remaining', `${6000 - rateLimiter.tokens}`);
+
+      const processedResponse = await processResponse(response);
+
+      return new Response(processedResponse.body, {
+        status: processedResponse.status,
+        headers: responseHeaders
+      });
+
+    } catch (error) {
+      console.error('Failed to fetch:', error);
+      return new Response(JSON.stringify({
+        error: 'Internal Server Error',
+        message: error.message
+      }), { 
+        status: 500,
+        headers: {
+          'Content-Type': 'application/json'
+        }
+      });
     }
-
-    const response = await fetch(targetUrl, {
-      method: request.method,
-      headers: headers,
-      body: request.body
-    });
-
-    const responseHeaders = new Headers(response.headers);
-    responseHeaders.set('Referrer-Policy', 'no-referrer');
-    responseHeaders.set('X-RateLimit-Remaining', `${30 - rateLimiter.requests}`);
-    responseHeaders.set('X-TokenLimit-Remaining', `${6000 - rateLimiter.tokens}`);
-
-    const processedResponse = await processResponse(response);
-
-    return new Response(processedResponse.body, {
-      status: processedResponse.status,
-      headers: responseHeaders
-    });
-
-  } catch (error) {
-    console.error('Failed to fetch:', error);
-    return new Response(JSON.stringify({
-      error: 'Internal Server Error',
-      message: error.message
-    }), { 
-      status: 500,
-      headers: {
-        'Content-Type': 'application/json'
-      }
-    });
   }
+
+  // 其他未匹配路径返回404
+  return new Response('Not Found', { status: 404 });
 }
 
 Deno.serve(handleRequest);
